@@ -1,0 +1,129 @@
+const { redis, hasDb, verify, body, getAuth, dk, prefix, unsafePreview } = require('./_lib');
+const PUB = { projects: 'projects', cfg: 'cfg', testi: 'testi' };
+const LOCS = ['Panvel', 'Karanjade', 'Pushpak Nagar', 'Ulwe', 'Kharghar', 'Taloja', 'Kamothe', 'Kalamboli'];
+const TYPES = ['flat', 'plot', 'villa', 'shop', 'office'];
+const STATUSES = ['draft', 'active', 'inactive', 'archived'];
+const TXS = ['Buy', 'Sale', 'Resale', 'Rent'];
+const AVAIL = ['Active', 'Sold'];
+const DOMS = ['in', 'org', 'master'];
+const STR = ['name', 'sec', 'bhk', 'ps', 're', 'img', 'vid', 'near', 'desc', 'd2', 'd3', 'pdf1', 'pdf2', 'pdf3', 'wa'];
+const probe = async () => { try { return (await redis(['PING'])) === 'PONG'; } catch (e) { return false; } };
+const num = (v) => { const x = Number(v); return isFinite(x) && x >= 0 ? x : 0; };
+const pickCI = (list, v) => list.find((x) => x.toLowerCase() === String(v == null ? '' : v).trim().toLowerCase());
+
+// Server-side validation: every property is checked and cleaned before it is saved.
+function cleanProject(p) {
+  if (!p || typeof p !== 'object') return { e: 'row is not an object' };
+  const id = String(p.id || '').trim();
+  if (!/^[A-Za-z0-9_-]{2,40}$/.test(id)) return { e: 'bad property id "' + id.slice(0, 20) + '"' };
+  const o = { id };
+  for (const k of STR) o[k] = String(p[k] == null ? '' : p[k]).trim().slice(0, k === 'img' ? 4000 : k === 'wa' ? 3000 : 2000);
+  if (!o.name) return { e: id + ': project name missing' };
+  const loc = pickCI(LOCS, p.loc); if (!loc) return { e: id + ': location not allowed' }; o.loc = loc;
+  const ty = pickCI(TYPES, p.ty || 'flat'); if (!ty) return { e: id + ': type not allowed' }; o.ty = ty;
+  const st = pickCI(STATUSES, p.st || (p.on === false ? 'inactive' : 'active')); if (!st) return { e: id + ': status not allowed' }; o.st = st;
+  const tx = pickCI(TXS, p.tx || 'Buy'); if (!tx) return { e: id + ': Sale/Rent value not allowed' }; o.tx = tx;
+  const av = pickCI(AVAIL, p.stt || 'Active'); if (!av) return { e: id + ': availability not allowed' }; o.stt = av;
+  const doms = Array.isArray(p.doms) ? p.doms.map((d) => String(d).trim().toLowerCase()) : [];
+  if (doms.some((d) => !DOMS.includes(d))) return { e: id + ': domain not allowed' };
+  o.doms = [...new Set(doms)];
+  o.pl = num(p.pl); o.cp = num(p.cp);
+  if (p.seo && typeof p.seo === 'object') o.seo = { t: String(p.seo.t || '').slice(0, 200), d: String(p.seo.d || '').slice(0, 400) };
+  o.on = o.st === 'active';
+  return { o, created: Number(p.created) || 0 };
+}
+const strip = (p) => { const { created, updated, ...r } = p; return JSON.stringify(r); };
+function diff(oldArr, newArr, by) {
+  const o = new Map(oldArr.map((p) => [p.id, p])), n = new Map(newArr.map((p) => [p.id, p])), ev = [];
+  for (const [id, p] of n) {
+    const q = o.get(id);
+    if (!q) { ev.push({ a: 'create', id, name: p.name }); continue; }
+    const ch = Object.keys(p).filter((k) => !['created', 'updated'].includes(k) && JSON.stringify(p[k]) !== JSON.stringify(q[k]));
+    if (!ch.length) continue;
+    let a = 'edit';
+    if (ch.includes('st')) a = p.st === 'active' ? 'publish' : p.st === 'archived' ? 'archive' : p.st === 'inactive' ? 'deactivate' : 'status-' + p.st;
+    ev.push({ a, id, name: p.name, fields: ch.slice(0, 10) });
+  }
+  for (const [id, q] of o) if (!n.has(id)) ev.push({ a: 'delete', id, name: q.name });
+  const t = Date.now();
+  return ev.map((e) => ({ ...e, by, t }));
+}
+module.exports = async (req, res) => {
+  if (req.method === 'OPTIONS') { res.setHeader('Access-Control-Allow-Origin', '*'); res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS'); res.setHeader('Access-Control-Allow-Headers', 'Content-Type'); return res.status(204).end(); }
+  try {
+    const k = String((req.query && req.query.key) || '');
+    // Open https://YOUR-SITE/api/data in a browser to check the database (shows yes/no only).
+    if (req.method === 'GET' && !k) {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      return res.status(200).json({ ok: true, databaseKeysFound: hasDb(), databaseReachable: hasDb() ? await probe() : false, prefix: prefix(), stagingBlocked: unsafePreview() });
+    }
+    if (!hasDb()) return res.status(503).json({ ok: false, error: unsafePreview() ? 'staging needs DB_PREFIX' : 'database not connected' });
+    let s = verify((req.headers.authorization || '').replace('Bearer ', ''));
+    if (s) { const au = await getAuth(); if ((s.v || 0) !== (au.ver || 0)) s = null; }
+    if (req.method === 'GET') {
+      if (PUB[k]) {
+        const v = await redis(['GET', dk(PUB[k])]);
+        res.setHeader('Cache-Control', 's-maxage=10, stale-while-revalidate=30');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        return res.status(200).json({ ok: true, data: v ? JSON.parse(v) : null });
+      }
+      if (k === 'leads' || k === 'audit') {
+        if (!s) return res.status(401).json({ ok: false });
+        const v = await redis(['LRANGE', dk(k), 0, 199]);
+        return res.status(200).json({ ok: true, data: v.map((x) => JSON.parse(x)) });
+      }
+      return res.status(404).json({ ok: false });
+    }
+    if (req.method === 'POST') {
+      if (!s) return res.status(401).json({ ok: false });
+      const b = body(req);
+      if (k === 'leads') {
+        if (s.role !== 'Super Admin') return res.status(403).json({ ok: false });
+        const cur = (await redis(['LRANGE', dk('leads'), 0, -1])).map((x) => JSON.parse(x)).filter((l) => l.id !== b.del);
+        await redis(['DEL', dk('leads')]);
+        for (const l of cur.reverse()) await redis(['LPUSH', dk('leads'), JSON.stringify(l)]);
+        return res.status(200).json({ ok: true });
+      }
+      if (!PUB[k]) return res.status(404).json({ ok: false });
+      const d = b.data;
+      if (JSON.stringify(d || null).length > 900000) return res.status(413).json({ ok: false });
+      if (k === 'cfg' ? (typeof d !== 'object' || Array.isArray(d) || !d) : !Array.isArray(d)) return res.status(400).json({ ok: false });
+      if (k !== 'projects') {
+        if (s.role !== 'Super Admin') return res.status(403).json({ ok: false });
+        await redis(['SET', dk(PUB[k]), JSON.stringify(d)]);
+        await redis(['LPUSH', dk('audit'), JSON.stringify({ a: 'edit-' + k, id: k, name: '', by: s.u, t: Date.now() })]);
+        return res.status(200).json({ ok: true });
+      }
+      if (d.length > 2000) return res.status(413).json({ ok: false });
+      const cleaned = [], seen = new Set();
+      for (let i = 0; i < d.length; i++) {
+        const c = cleanProject(d[i]);
+        if (c.e) return res.status(400).json({ ok: false, error: 'invalid', detail: 'row ' + (i + 1) + ': ' + c.e });
+        const key = c.o.id.toLowerCase();
+        if (seen.has(key)) return res.status(400).json({ ok: false, error: 'duplicate', detail: 'Property ID "' + c.o.id + '" is used twice' });
+        seen.add(key); cleaned.push(c);
+      }
+      const raw = await redis(['GET', dk('projects')]);
+      const old = raw ? JSON.parse(raw) : null;
+      if (s.role !== 'Super Admin') {
+        if (!old || old.length !== cleaned.length || !cleaned.every((c) => old.some((q) => q.id === c.o.id))) return res.status(403).json({ ok: false });
+      }
+      const oldMap = new Map((old || []).map((q) => [q.id, q])), now = Date.now();
+      const next = cleaned.map((c) => {
+        const q = oldMap.get(c.o.id), o = c.o;
+        o.created = q ? (q.created || now) : (c.created || now);
+        o.updated = q && strip(q) === strip(o) ? (q.updated || now) : now;
+        return o;
+      });
+      const events = diff(old || [], next, s.u);
+      if (raw) await redis(['SET', dk('projects:prev'), raw]); // one-step undo copy
+      await redis(['SET', dk('projects'), JSON.stringify(next)]);
+      if (events.length) { await redis(['LPUSH', dk('audit'), ...events.map((e) => JSON.stringify(e))]); await redis(['LTRIM', dk('audit'), 0, 1999]); }
+      return res.status(200).json({ ok: true, count: next.length, changes: events.length });
+    }
+    return res.status(405).json({ ok: false });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false });
+  }
+};
